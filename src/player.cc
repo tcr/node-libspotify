@@ -93,6 +93,10 @@ extern int call_music_delivery_callback(sp_session* session, const sp_audioforma
 	return num_frames;
 }
 
+static void free_music_data(char* data, void* hint) {
+	free(hint);
+}
+
 static void read_delivered_music(uv_timer_t* handle, int status) {
 	audio_fifo_t* af = &g_audiofifo;
 	audio_fifo_data_t* afd;
@@ -107,45 +111,43 @@ static void read_delivered_music(uv_timer_t* handle, int status) {
 		if (!afd) {
 			break;
 		}
-			
+		
+		HandleScope scope;
+		
 		sp_session* spsession = afd->session;
 		ObjectHandle<sp_session>* session = (ObjectHandle<sp_session>*) sp_session_userdata(spsession);
-	
+		
 		Handle<Value> cbv = session->object->Get(String::New("music_delivery"));
 		
 		if (!cbv->IsFunction()) {
 			return;
 		}
 		
-		HandleScope scope;
-		
-		Local<Object> globalObj = Context::GetCurrent()->Global();
-		
-		// Create a node Buffer
-		v8::Local<v8::Function> bufferConstructor = v8::Local<v8::Function>::Cast(globalObj->Get(v8::String::New("Buffer")));
-		
-		int length = afd->nsamples * sizeof(int16_t) * afd->channels;
-		
-		v8::Handle<v8::Value> bufferArgs[1] = { v8::Integer::New(length) };
-		v8::Local<v8::Object> buffer = bufferConstructor->NewInstance(1, bufferArgs);
-		
-		// Copy the data to the node buffer
-		memcpy(node::Buffer::Data(buffer), (char*) afd->samples, length);
-	
-		// Call the music_delivery JS function
 		Handle<Function> cb = Local<Function>(Function::Cast(*cbv));
 		
-		Local<Value> argv[1] = { scope.Close(buffer) };
+		// Create SlowBuffer
+		Buffer* buffer = Buffer::New((char*) afd->samples, afd->nsamples * sizeof(int16_t) * afd->channels, free_music_data, afd);
 		
-		Handle<Value> send_more_data = cb->Call(Context::GetCurrent()->Global(), 1, argv);
+		// Create a node buffer based off the slowbuffer
+		v8::Local<v8::Object> globalObj = v8::Context::GetCurrent()->Global();
+		v8::Local<v8::Function> bufferConstructor = v8::Local<v8::Function>::Cast(globalObj->Get(v8::String::New("Buffer")));
+		v8::Handle<v8::Value> constructorArgs[3] = { buffer->handle_, v8::Integer::New(afd->nsamples * sizeof(int16_t) * afd->channels), v8::Integer::New(0) };
+		v8::Local<v8::Object> actualBuffer = bufferConstructor->NewInstance(3, constructorArgs);
+		
+		// Call the music_delivery JS function
+		Local<Value> argv[1] = { actualBuffer };
+		Handle<Value> send_more_data = cb->Call(globalObj, 1, argv);
 		
 		// The music_delivery function returns whether or not we should keep sending data or not
 		assert(send_more_data->IsBoolean());
 		
-		// Pause the delivery of data because we have been told that no more data can be handled, it's up to whoever told us to stop to call Session_Player_Stream_Resume to resume data
+		// Pause the delivery of data because we have been told that no more data can be handled,
+		// it's up to whoever told us to stop to call Session_Player_Stream_Resume to resume data
 		if (!send_more_data->ToBoolean()->Value()) {
 			pause_delivery = 1;
 		}
+		
+		scope.Close(Undefined());
 	}
 
 	return;
