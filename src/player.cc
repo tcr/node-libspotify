@@ -27,9 +27,26 @@ using namespace node;
 #define BUFFER_SIZE 44100
 // one second buffer
 
-
 static audio_fifo_t g_audiofifo;
+static int pause_delivery;
 
+/**
+ * spotify callback for the end_of_track event. It's in here because at some point we'll need to be able to check the audio buffer to see if it's been sent fully before sending the end_of_track event
+ * See https://developer.spotify.com/technologies/libspotify/docs/12.1.45/structsp__session__callbacks.html
+ */
+extern void call_end_of_track_callback(sp_session* session) {
+    ObjectHandle<sp_session>* s = (ObjectHandle<sp_session>*) sp_session_userdata(session);
+    Handle<Object> o = s->object;
+    Handle<Value> cbv = o->Get(String::New("end_of_track"));
+    if(!cbv->IsFunction()) {
+        return;
+    }
+
+    Handle<Function> cb = Local<Function>(Function::Cast(*cbv));
+    const unsigned int argc = 0;
+    Local<Value> argv[argc] = {};
+    cb->Call(Context::GetCurrent()->Global(), argc, argv);
+}
 
 /**
  * spotify callback for the music_delivery event.
@@ -41,9 +58,10 @@ extern int call_music_delivery_callback(sp_session* session, const sp_audioforma
 	audio_fifo_data_t *afd;
 	size_t s;
 
-	if (num_frames == 0)
-		return 0; // Audio discontinuity, do nothing
-
+	if (num_frames == 0) {		
+        return 0; // Audio discontinuity, do nothing
+	}
+	
     // make sure we're the only one using the queue
 	pthread_mutex_lock(&af->mutex);
 
@@ -76,41 +94,63 @@ extern int call_music_delivery_callback(sp_session* session, const sp_audioforma
 }
 
 static void free_music_data(char* data, void* hint) {
-    free(hint);
+	free(hint);
 }
 
 static void read_delivered_music(uv_timer_t* handle, int status) {
-    audio_fifo_t* af = &g_audiofifo;
-    audio_fifo_data_t* afd;
+	audio_fifo_t* af = &g_audiofifo;
+	audio_fifo_data_t* afd;
 
-    if(af->qlen == 0) {
-        return;
-    }
+	if (af->qlen == 0) {
+		return;
+	}
+	
+	while (af->qlen > 0 && !pause_delivery) {
+		afd = audio_get(af);
+		
+		if (!afd) {
+			break;
+		}
+		
+		HandleScope scope;
+		
+		sp_session* spsession = afd->session;
+		ObjectHandle<sp_session>* session = (ObjectHandle<sp_session>*) sp_session_userdata(spsession);
+		
+		Handle<Value> cbv = session->object->Get(String::New("music_delivery"));
+		
+		if (!cbv->IsFunction()) {
+			return;
+		}
+		
+		Handle<Function> cb = Local<Function>(Function::Cast(*cbv));
+		
+		// Create SlowBuffer
+		Buffer* buffer = Buffer::New((char*) afd->samples, afd->nsamples * sizeof(int16_t) * afd->channels, free_music_data, afd);
+		
+		// Create a node buffer based off the slowbuffer
+		v8::Local<v8::Object> globalObj = v8::Context::GetCurrent()->Global();
+		v8::Local<v8::Function> bufferConstructor = v8::Local<v8::Function>::Cast(globalObj->Get(v8::String::New("Buffer")));
+		v8::Handle<v8::Value> constructorArgs[3] = { buffer->handle_, v8::Integer::New(afd->nsamples * sizeof(int16_t) * afd->channels), v8::Integer::New(0) };
+		v8::Local<v8::Object> actualBuffer = bufferConstructor->NewInstance(3, constructorArgs);
+		
+		// Call the music_delivery JS function
+		Local<Value> argv[1] = { actualBuffer };
+		Handle<Value> send_more_data = cb->Call(globalObj, 1, argv);
+		
+		// The music_delivery function returns whether or not we should keep sending data or not
+		assert(send_more_data->IsBoolean());
+		
+		// Pause the delivery of data because we have been told that no more data can be handled,
+		// it's up to whoever told us to stop to call Session_Player_Stream_Resume to resume data
+		if (!send_more_data->ToBoolean()->Value()) {
+			pause_delivery = 1;
+		}
+		
+		scope.Close(Undefined());
+	}
 
-    while(af->qlen > 0) {
-        afd = audio_get(af);
-        if(!afd) {
-            break;
-        }
-
-        sp_session* spsession = afd->session;
-        ObjectHandle<sp_session>* session = (ObjectHandle<sp_session>*) sp_session_userdata(spsession);
-
-        Handle<Value> cbv = session->object->Get(String::New("music_delivery"));
-        if(!cbv->IsFunction()) {
-            return;
-        }
-        Handle<Function> cb = Local<Function>(Function::Cast(*cbv));
-
-        Buffer* buffer = Buffer::New((char*) afd->samples, afd->nsamples * sizeof(int16_t)* afd->channels, free_music_data, afd);
-        buffer->handle_->Set(String::New("channels"), Number::New(afd->channels));
-        buffer->handle_->Set(String::New("rate"), Number::New(afd->rate));
-
-        Local<Value> argv[1] = { Local<Value>::New(buffer->handle_) };
-        cb->Call(Context::GetCurrent()->Global(), 1, argv);
-    }
-
-    return;
+	return;
 }
 
 
@@ -148,7 +188,20 @@ static Handle<Value> Session_Player_Play(const Arguments& args) {
 
     sp_error error = sp_session_player_play(session->pointer, args[1]->BooleanValue());
     NSP_THROW_IF_ERROR(error);
+	
+	pause_delivery = 0;
+	
+    return scope.Close(Undefined());
+}
 
+/**
+ *  more data is required by the stream
+ */
+static Handle<Value> Session_Player_Stream_Resume(const Arguments& args) {
+    HandleScope scope;
+	
+	pause_delivery = 0;
+	
     return scope.Close(Undefined());
 }
 
@@ -157,6 +210,7 @@ static uv_timer_t read_music_handle;
 void nsp::init_player(Handle<Object> target) {
     NODE_SET_METHOD(target, "session_player_load", Session_Player_Load);
     NODE_SET_METHOD(target, "session_player_play", Session_Player_Play);
+    NODE_SET_METHOD(target, "session_player_stream_resume", Session_Player_Stream_Resume);
 
     audio_fifo_t* af = &g_audiofifo;
 	TAILQ_INIT(&af->q);
